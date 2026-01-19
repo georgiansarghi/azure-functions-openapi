@@ -5,9 +5,10 @@ from typing import Any, Dict, List
 
 import yaml
 
+from azure_functions_openapi.cache import (
+    cached_openapi_spec,
+)
 from azure_functions_openapi.decorator import get_openapi_registry
-from azure_functions_openapi.utils import model_to_schema
-from azure_functions_openapi.cache import cached_openapi_spec, cached_openapi_json, cached_openapi_yaml
 from azure_functions_openapi.errors import OpenAPIError
 
 logger = logging.getLogger(__name__)
@@ -21,6 +22,37 @@ def generate_openapi_spec(title: str = "API", version: str = "1.0.0") -> Dict[st
     try:
         registry = get_openapi_registry()
         paths: Dict[str, Dict[str, Any]] = {}
+
+        # Collect all Pydantic models to generate shared schemas
+        all_models = []
+        for meta in registry.values():
+            if meta.get("request_model"):
+                all_models.append(meta["request_model"])
+            if meta.get("response_model"):
+                all_models.append(meta["response_model"])
+
+        shared_definitions = {}
+        if all_models:
+            from pydantic.json_schema import models_json_schema
+
+            inputs = [(m, "validation") for m in all_models]
+            # models_json_schema returns (schemas_by_input, shared_definitions)
+            generated_schemas, definitions = models_json_schema(
+                inputs, ref_template="#/components/schemas/{model}"
+            )
+
+            # 1. Add the explicit models we asked for
+            for (model, _), schema in generated_schemas.items():
+                shared_definitions[model.__name__] = schema
+
+            # 2. Add any shared definitions (nested models referenced by the above)
+            if definitions:
+                # If definitions contains $defs, extract it (Pydantic behavior varies by structure)
+                # But usually definitions is just a dict of {name: schema}
+                if "$defs" in definitions:
+                    shared_definitions.update(definitions["$defs"])
+                else:
+                    shared_definitions.update(definitions)
 
         for func_name, meta in registry.items():
             try:
@@ -38,17 +70,20 @@ def generate_openapi_spec(title: str = "API", version: str = "1.0.0") -> Dict[st
 
                 if meta.get("response_model"):
                     try:
+                        model = meta["response_model"]
+                        # Use reference to the shared schema
+                        schema_ref = f"#/components/schemas/{model.__name__}"
                         responses["200"] = {
                             "description": "Successful Response",
-                            "content": {
-                                "application/json": {"schema": model_to_schema(meta["response_model"])}
-                            },
+                            "content": {"application/json": {"schema": {"$ref": schema_ref}}},
                         }
                     except Exception as e:
-                        logger.warning(f"Failed to generate response schema for {func_name}: {str(e)}")
+                        logger.warning(
+                            f"Failed to generate response schema for {func_name}: {str(e)}"
+                        )
                         responses["200"] = {
                             "description": "Successful Response",
-                            "content": {"application/json": {"schema": {"type": "object"}}}
+                            "content": {"application/json": {"schema": {"type": "object"}}},
                         }
 
                 # operation object ------------------------------------------------
@@ -74,29 +109,31 @@ def generate_openapi_spec(title: str = "API", version: str = "1.0.0") -> Dict[st
                         }
                     elif meta.get("request_model"):
                         try:
+                            model = meta["request_model"]
+                            schema_ref = f"#/components/schemas/{model.__name__}"
                             op["requestBody"] = {
                                 "required": True,
-                                "content": {
-                                    "application/json": {"schema": model_to_schema(meta["request_model"])}
-                                },
+                                "content": {"application/json": {"schema": {"$ref": schema_ref}}},
                             }
                         except Exception as e:
-                            logger.warning(f"Failed to generate request schema for {func_name}: {str(e)}")
+                            logger.warning(
+                                f"Failed to generate request schema for {func_name}: {str(e)}"
+                            )
                             op["requestBody"] = {
                                 "required": True,
-                                "content": {"application/json": {"schema": {"type": "object"}}}
+                                "content": {"application/json": {"schema": {"type": "object"}}},
                             }
 
                 # merge into paths (support multiple methods per route) ----------
                 paths.setdefault(path, {})[method] = op
-                
+
             except Exception as e:
                 logger.error(f"Failed to process function {func_name}: {str(e)}")
                 # Continue processing other functions
                 continue
 
         spec = {
-            "openapi": "3.0.0",
+            "openapi": "3.1.0",
             "info": {
                 "title": title,
                 "version": version,
@@ -105,18 +142,19 @@ def generate_openapi_spec(title: str = "API", version: str = "1.0.0") -> Dict[st
                     "Markdown supported in descriptions (CommonMark)."
                 ),
             },
+            "components": {
+                "schemas": shared_definitions,
+            },
             "paths": paths,
         }
-        
+
         logger.info(f"Generated OpenAPI spec with {len(paths)} paths for {len(registry)} functions")
         return spec
-        
+
     except Exception as e:
         logger.error(f"Failed to generate OpenAPI specification: {str(e)}")
         raise OpenAPIError(
-            message="Failed to generate OpenAPI specification",
-            details={"error": str(e)},
-            cause=e
+            message="Failed to generate OpenAPI specification", details={"error": str(e)}, cause=e
         )
 
 
@@ -131,9 +169,7 @@ def get_openapi_json(title: str = "API", version: str = "1.0.0") -> str:
     except Exception as e:
         logger.error(f"Failed to generate OpenAPI JSON: {str(e)}")
         raise OpenAPIError(
-            message="Failed to generate OpenAPI JSON",
-            details={"error": str(e)},
-            cause=e
+            message="Failed to generate OpenAPI JSON", details={"error": str(e)}, cause=e
         )
 
 
@@ -148,7 +184,5 @@ def get_openapi_yaml(title: str = "API", version: str = "1.0.0") -> str:
     except Exception as e:
         logger.error(f"Failed to generate OpenAPI YAML: {str(e)}")
         raise OpenAPIError(
-            message="Failed to generate OpenAPI YAML",
-            details={"error": str(e)},
-            cause=e
+            message="Failed to generate OpenAPI YAML", details={"error": str(e)}, cause=e
         )
